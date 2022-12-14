@@ -32,6 +32,8 @@ def _get_command(
     store_grads,
     orthogonal_projection_path,
     orthogonal_projection_rank,
+    l0_coef,
+    sparsity_pen_num
 ):
     task_name_to_factor = {
         "sst-2": 1, "qnli": 2, "qqp": 6, "mnli": 6,
@@ -53,7 +55,7 @@ def _get_command(
         if non_private.lower() in ('yes', 'y', 'true', 't'):
             learning_rate = 5e-5
         else:
-            learning_rate = 5e-4
+            learning_rate = 5e-4 
 
     data_dir = f"{data_dir}/{common.task_name2suffix_name[task_name]}"
     template = {
@@ -71,29 +73,30 @@ python -m classification.run_classification \
   --output_dir {output_dir} \
   --overwrite_output_dir \
   --model_name_or_path {model_name_or_path} \
-  --few_shot_type {few_shot_type} \
-  --num_k 1 \
+  --few_shot_type finetune \
   --num_sample 1 --seed {seed} \
-  --template {template} \
-  --non_private {non_private} \
-  --num_train_epochs {num_train_epochs} \
-  --target_epsilon {target_epsilon} \
+  --non_private no \
+  --num_train_epochs 2 \
+  --target_epsilon 8 \
   --per_device_train_batch_size {per_device_train_batch_size} \
   --gradient_accumulation_steps {gradient_accumulation_steps} \
   --per_device_eval_batch_size 8 \
-  --per_example_max_grad_norm 0.1 --clipping_mode {clipping_mode} \
+  --per_example_max_grad_norm 0.1 \
+  --clipping_mode default \
   --learning_rate {learning_rate} \
-  --lr_decay yes \
+  --lr_decay no \
   --adam_epsilon 1e-08 \
   --weight_decay 0 \
   --max_seq_len 256 \
   --evaluation_strategy steps --eval_steps {eval_steps} --evaluate_before_training True \
-  --do_train --do_eval \
+  --do_train \
+  --do_eval \
   --first_sent_limit 200 --other_sent_limit 200 --truncate_head yes \
   --attention_only {attention_only} --static_lm_head {static_lm_head} --static_embedding {static_embedding} \
   --randomly_initialize {randomly_initialize} \
   --eval_spectrum {eval_spectrum} --max_spectrum_batches {max_spectrum_batches} --max_lanczos_iter {max_lanczos_iter} \
-  --store_grads {store_grads}'''
+  --store_grads {store_grads} \
+  --l0_coef {l0_coef} --sparsity_pen_num {sparsity_pen_num}  '''
     if orthogonal_projection_path is not None:
         cmd += f' --orthogonal_projection_path {orthogonal_projection_path}'
         cmd += f' --orthogonal_projection_rank {orthogonal_projection_rank}'
@@ -103,19 +106,19 @@ python -m classification.run_classification \
 def main(
     output_dir,
     task_name,
-    few_shot_type="prompt",
+    few_shot_type="finetune",
     seed=42,
-    model_name_or_path="roberta-base",
+    model_name_or_path="bert-base-uncased",
     data_dir="classification/data/original",
     learning_rate=None,
-    clipping_mode="ghost",
+    clipping_mode="default",
     non_private="no",
     target_epsilon=8,
     attention_only="no",
     static_lm_head="no",
     static_embedding="no",
-    per_device_train_batch_size=20,
-    eval_steps=10,
+    per_device_train_batch_size=16,
+    eval_steps=100,
     eval_spectrum="no",
     max_spectrum_batches=2,
     max_lanczos_iter=2,
@@ -125,6 +128,8 @@ def main(
     store_grads="no",
     orthogonal_projection_path=None,
     orthogonal_projection_rank=100,
+    l0_coef=0.1,
+    sparsity_pen_num=0.000000125
 ):
     command = _get_command(
         output_dir=output_dir,
@@ -151,6 +156,8 @@ def main(
         store_grads=store_grads,
         orthogonal_projection_path=orthogonal_projection_path,
         orthogonal_projection_rank=orthogonal_projection_rank,
+        l0_coef=l0_coef,
+        sparsity_pen_num=sparsity_pen_num
     )
     print('Running command:')
     print(command)

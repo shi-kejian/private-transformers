@@ -51,6 +51,8 @@ from transformers.trainer_utils import EvaluationStrategy, IntervalStrategy, Tra
 from transformers.utils import logging
 
 from .compiled_args import TrainingArguments
+from IPython import embed
+import numpy as np
 
 _use_native_amp = False
 _use_apex = False
@@ -148,6 +150,32 @@ def default_dev_objective_key(metrics):
     raise Exception("No metric founded for {}".format(metrics))
 
 
+''''''
+
+def concrete_stretched(alpha, l=0., r = 1.):
+    u = torch.zeros_like(alpha).uniform_().clamp_(0.0001, 0.9999)
+    s = (torch.sigmoid(u.log() - (1-u).log() + alpha)).detach()
+    u = s*(r-l) + l
+    t = u.clamp(0, 1000)
+    z = t.clamp(-1000, 1)
+    dz_dt = (t < 1).float().to(alpha.device).detach()
+    dt_du = (u > 0).float().to(alpha.device).detach()
+    du_ds = r - l
+    ds_dalpha = (s*(1-s)).detach()
+    dz_dalpha = dz_dt*dt_du*du_ds*ds_dalpha
+    return z.detach(), dz_dalpha.detach()
+
+SPARSITY_PEN=0.00000012500
+CONCRETE_LOWER=-1.500
+CONCRETE_UPPER=1.500
+ALPHA_INIT=5
+FIX_LAYER=-1
+USE_PER_PARAMS_ALPHA=1
+USE_PER_LAYERS_ALPHA=0
+
+''''''
+
+
 class Trainer(transformers.Trainer):
     """
     Adding some functions based on Transformers' Trainer class.
@@ -159,6 +187,17 @@ class Trainer(transformers.Trainer):
         self.model_args = model_args
         self.auxiliary_args = auxiliary_args
         self.scaler = torch.cuda.amp.GradScaler(init_scale=128)
+
+        ''''''
+        # # load bert_params in kwargs
+        self.bert_params = None
+        self.alpha_params = None
+        self.finetune_params = None
+        self.per_params_alpha_dict = None
+        ''''''
+        self.l0_coef = 0.1
+        self.sparsity_pen_num = 0.000000125
+        ############### 
 
     # --- lxuechen: Not sure why v4.10.0 removed this function...
     def is_local_master(self) -> bool:
@@ -175,6 +214,7 @@ class Trainer(transformers.Trainer):
         are fixed and only the top layers are further fine-tuned.
         """
         if self.optimizer is None:
+            print('==========================YOU SHOULD NOT SEE THIS (self.optimizer is None)! =======================')
             params = {}
             for n, p in self.model.named_parameters():
                 if self.args.fix_layers > 0:
@@ -244,7 +284,7 @@ class Trainer(transformers.Trainer):
             num_train_epochs=num_train_epochs
         )
 
-    def train(self, model_path=None, dev_objective=None, dev_objective_key=None):
+    def train(self, model_path=None, dev_objective=None, dev_objective_key=None):      
         """
         Main training entry point.
 
@@ -346,6 +386,8 @@ class Trainer(transformers.Trainer):
 
         tr_loss = torch.tensor(0.0).to(self.args.device)
         logging_loss_scalar = 0.0
+        ''' '''
+        model.zero_grad()
 
         # --- low rank analysis project ---
         callback = None  # Default; don't store gradients or perform projection.
@@ -399,13 +441,30 @@ class Trainer(transformers.Trainer):
                 scheduler=scheduler,
             )
 
+
+        total_layers = 14 if "base" in self.args.model_name_or_path else 26
+
+        sparsity_pen = [self.sparsity_pen_num] * total_layers  # NB(anon)
+
+        modelname = 'bert'
+        # get sparsity penalty
+        def get_layer_ind(n):
+            if "%s.embeddings"%modelname in n:
+                ind = 0
+            elif "%s.encoder.layer"%modelname in n:
+                ind = int(n.replace("%s.encoder.layer."%modelname, "").split(".")[0]) + 1
+            else:
+                ind = total_layers - 1
+            return ind
+
         train_iterator = trange(epochs_trained, int(num_train_epochs), desc="Epoch", disable=not self.is_local_master())
         for epoch in train_iterator:
+            print('##############################USE_PER_PARAMS_ALPHA##############################', USE_PER_PARAMS_ALPHA)
             # Clear gradient before entering a new epochs.
             # This is ultra important when using gradient accumulation in privacy training;
             # grads of micro batches could ooze.
-            model.zero_grad(set_to_none=True)
-
+            # model.zero_grad(set_to_none=True) 
+            # 12/03: Not using grad_accum in the trial run, comment out the above line
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
 
@@ -417,14 +476,71 @@ class Trainer(transformers.Trainer):
             else:
                 epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=False)
 
-            for step, inputs in enumerate(epoch_iterator):
-
+            for step, inputs in enumerate(epoch_iterator): 
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
+                nonzero_params = 0
+                grad_params = {}
+                if CONCRETE_LOWER == 0:
+                    log_ratio = 0
+                else:
+                    log_ratio = np.log(-CONCRETE_LOWER / CONCRETE_UPPER)
+                # l0_pen = 0
+                l0_pen = [0] * total_layers
+                l0_pen_sum = 0
+                if USE_PER_PARAMS_ALPHA:
+                    per_params_z = {}
+                    per_params_z_grad = {}
+                
+                for n, p in model.named_parameters():
+                    if n not in self.bert_params:
+                        print(" n not in self.bert_params", n)
+                        embed()
+                    assert(n in self.bert_params)
+                    if "classifier" in n:
+                        nonzero_params += p.numel()
+                        p.data.copy_(self.bert_params[n][0].data + self.bert_params[n][1].data)
+                    else:
+                        if USE_PER_PARAMS_ALPHA == 1:
+                            params_z, params_z_grad = concrete_stretched(self.per_params_alpha_dict[n], CONCRETE_LOWER,
+                                    CONCRETE_UPPER)
+                            per_params_z[n] = params_z
+                            per_params_z_grad[n] = params_z_grad
 
-                losses = self.training_step(model, inputs)
+                        z, z_grad = concrete_stretched(self.bert_params[n][2], CONCRETE_LOWER,
+                                                    CONCRETE_UPPER)
+                        # z, z_grad = concrete(self.bert_params[n][2], args.temp, discrete=False)
+                        ind = get_layer_ind(n)
+                        l0_pen[ind] += torch.sigmoid(self.bert_params[n][2] - log_ratio).sum()
+                        l0_pen_sum += torch.sigmoid(self.bert_params[n][2] - log_ratio).sum()
+
+                        if USE_PER_PARAMS_ALPHA == 1:
+                            z2 =  per_params_z[n]
+                        else:
+                            z2 = 1
+
+                        grad_params[n] = [self.bert_params[n][1] * z2, z * z2, z_grad, self.bert_params[n][1] * z]
+
+                        if USE_PER_PARAMS_ALPHA == 1:
+                            l0_pen[ind] += torch.sigmoid(self.per_params_alpha_dict[n] - log_ratio).sum()
+                    
+                        p.data.copy_(self.bert_params[n][0].data + (z2*z).data * self.bert_params[n][1].data)
+                        nonzero_params += ((z2*z)>0).float().detach().sum().item()
+
+                model.train() 
+                inputs = self._prepare_inputs(inputs)
+                loss = self.compute_loss(model, inputs, return_vector_loss=True)  # (batch_size,).
+
+                vector_loss = loss
+                scalar_loss = loss.mean(dim=0) / self.args.gradient_accumulation_steps
+
+                if self.privacy_args.non_private:
+                    scalar_loss.backward()
+                scalar_loss = scalar_loss.detach()
+                losses = dict(vector_loss=vector_loss, scalar_loss=scalar_loss)
+
                 tr_loss += losses["scalar_loss"]
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
@@ -434,12 +550,44 @@ class Trainer(transformers.Trainer):
                     # len(epoch_iterator) <= self.args.gradient_accumulation_steps
                     # and (step + 1) == len(epoch_iterator)
                     # ---
-                ):
+                ):                    
+                    sum_l0_pen = 0
+                    for i in range(total_layers):
+                        if l0_pen[i] != 0:
+                            sum_l0_pen += (sparsity_pen[i] * l0_pen[i]).sum()
+
+                    sum_l0_loss = sum_l0_pen.sum()
+
                     if self.privacy_args.non_private:
+                        for n, p in self.module.named_parameters():
+                            if p.grad is None:
+                                print('p.grad is None:', n)
+                                continue
+                            if "classifier" in n:
+                                self.bert_params[n][1].grad.copy_(p.grad.data)
+                                # print('p.grad.data':, p.grad.data)
+                            else:
+                                try:
+                                    self.bert_params[n][1].grad.copy_(p.grad.data * grad_params[n][1].data)
+                                except:
+                                    embed()
+                                self.bert_params[n][2].grad.copy_(p.grad.data * grad_params[n][0].data *
+                                                                    grad_params[n][2].data)
+                                                            
+                                self.per_params_alpha_dict[n].grad.copy_(torch.sum(p.grad.data * grad_params[n][3].data * 
+                                        per_params_z_grad[n].data))
+                        sum_l0_loss.backward()
+
                         # Don't double clip in private learning.
                         torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                        ## TODO: to include the additional clip in run_glue_diffprune.py
+                        torch.nn.utils.clip_grad_norm_(self.finetune_params, self.args.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.alpha_params, self.args.max_grad_norm)   
+
                         optimizer.step()
+ 
                     else:
+                        # print("Will use vector loss!")
                         if store_grads_dir is not None:
                             def callback(privacy_engine):
                                 """Store clipped gradients for spectrum analysis."""
@@ -450,12 +598,75 @@ class Trainer(transformers.Trainer):
                                     {"flat_grad": flat_grad.cpu().float()},
                                     utils.join(store_grads_dir, f'global_step_{self.global_step:06d}.ckpt')
                                 )
-
                         vector_loss = losses.get("vector_loss")
-                        self.optimizer.step(loss=vector_loss, callback=callback)
+
+                        l0_loss_scaled = self.l0_coef * sum_l0_loss
+       
+                        vector_loss_combined  = vector_loss + l0_loss_scaled
+
+                        ''' For recording'''
+                        # create a deep copy of the vector_loss
+                        vector_loss_copy = vector_loss.clone()
+                        vector_loss_copy = vector_loss_copy.mean()
+                        # create a deep copy of the 
+                        sum_l0_loss_copy = sum_l0_loss.clone()
+                        sum_l0_loss_copy *= self.l0_coef
+                        ''''''
+                        self.optimizer.step(loss=vector_loss_combined, grad_params=grad_params, per_params_z_grad=per_params_z_grad,callback=callback)
 
                     scheduler.step()
-                    model.zero_grad(set_to_none=True)
+                    # model.zero_grad(set_to_none=True)
+                    model.zero_grad()
+                    ''''''
+                    params_norm = [0, 0, 0, 0, 0, 0]
+                    exp_z = 0
+                    for n, p in self.bert_params.items():
+                        params_norm[0] += p[2].sum().item()
+                        params_norm[1] += p[2].norm().item()**2
+                        params_norm[2] += p[2].grad.norm().item()**2
+                        params_norm[3] += torch.sigmoid(p[2]).sum().item()
+                        params_norm[4] += p[2].numel()
+                        # params_norm[5] += (grad_params[n][1] > 0).float().sum().item()
+                        if USE_PER_PARAMS_ALPHA == 1:
+                            exp_z += (torch.sigmoid(p[2]).sum() * torch.sigmoid(self.per_params_alpha_dict[n])).item()
+                        else:
+                            exp_z += torch.sigmoid(p[2]).sum().item()
+
+                        p[1].grad.zero_()
+                        p[2].grad.zero_()
+
+                    mean_exp_z = exp_z / params_norm[4]
+
+                    if USE_PER_PARAMS_ALPHA == 1:
+                        for n,p in self.per_params_alpha_dict.items():
+                            p.grad.zero_()
+
+                    # if (self.global_step + 1)% 100 == 0:
+                        # print("outdated average prob: %.4f, new average prob: %.4f, (!)empirical prob: %.4f, alpha_norm: %.4f, alpha_grad_norm: %.8f, alpha_avg: %.4f, l0_pen: %.2f, \n" %
+                        #     (params_norm[3]/params_norm[4], mean_exp_z, nonzero_params/params_norm[4],
+                        #     params_norm[1]**0.5, params_norm[2]**0.5, params_norm[0]/params_norm[4],
+                        #     l0_pen_sum))
+                        # instead of printing, write to a file, with l0_coef included in the filename
+                        # with open(f'params_norm_{self.args.learning_rate}_{self.args.batch_size}_{self.privacy_args.per_example_max_grad_norm}_{self.l0_coef}_{self.sparsity_pen_num}_1212.txt', 'a') as f:
+                        #     f.write('step: ' + str(step) + '\n')
+                        #     f.write('outdated average prob: %.4f, new average prob: %.4f, (!)empirical prob: %.4f, alpha_norm: %.4f, alpha_grad_norm: %.8f, alpha_avg: %.4f, l0_pen: %.2f, sum_l0_loss: %.4f \n' %
+                        #     (params_norm[3]/params_norm[4], mean_exp_z, nonzero_params/params_norm[4],
+                        #     params_norm[1]**0.5, params_norm[2]**0.5, params_norm[0]/params_norm[4],
+                        #     l0_pen_sum, sum_l0_loss))
+                        #     f.write('==========\n')
+                        # # write training loss to a file, as well as l0_penalty 
+                        # with open(f'train_loss_{self.args.learning_rate}_{self.args.batch_size}_{self.privacy_args.per_example_max_grad_norm}_{self.l0_coef}_{self.sparsity_pen_num}_1212.txt', 'a') as f:
+                        #     f.write('step: ' + str(step) + '\n')
+                        #     f.write('train loss: %.4f, l0_pen: %.2f, sum_l0_loss: %.3f \n' %
+                        #     (logging_loss_scalar, l0_pen_sum, sum_l0_loss))
+                        #     f.write('==========\n')
+                        # # also write the vector_loss_combined_copy and sum_l0_loss_copy to a file, as a json file
+                        # with open(f'losses_{self.args.learning_rate}_{self.args.batch_size}_{self.privacy_args.per_example_max_grad_norm}_{self.l0_coef}_{self.sparsity_pen_num}_1212.txt', 'a') as f:
+                        #     f.write('step: ' + str(step) + '\n')
+                        #     f.write('vector_loss_combined_copy: %.5f, sum_l0_loss_copy: %.5f, \n' %
+                        #     (vector_loss_copy, sum_l0_loss_copy))
+                        #     f.write('==========\n')
+                    # ''''''
                     self.global_step += 1
                     self.epoch = epoch + (step + 1) / len(epoch_iterator)
 
@@ -503,7 +714,7 @@ class Trainer(transformers.Trainer):
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(self.global_step, tr_loss / self.global_step, metrics=metrics), self.objective
 
-    def compute_loss(self, model, inputs, return_outputs=False, return_vector_loss=False):
+    def compute_loss(self, model, inputs, return_outputs=False, return_vector_loss=False): 
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
@@ -519,8 +730,8 @@ class Trainer(transformers.Trainer):
             loss = loss.mean(dim=0)
         return (loss, (loss,) + outputs) if return_outputs else loss
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> dict:
-        model.train()
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> dict:  
+        model.train() 
         inputs = self._prepare_inputs(inputs)
         loss = self.compute_loss(model, inputs, return_vector_loss=True)  # (batch_size,).
 
@@ -532,6 +743,8 @@ class Trainer(transformers.Trainer):
 
         scalar_loss = scalar_loss.detach()
         return dict(vector_loss=vector_loss, scalar_loss=scalar_loss)
+
+
 
     """
     Difference compared to original implementation: return output instead of output.metrics (so there is also the 
@@ -599,6 +812,12 @@ class Trainer(transformers.Trainer):
         logs = dict(dev=metrics)
 
         tr_loss_scalar = tr_loss.item()
+        # print('===========INSIDE EVALUATE AND LOG===========')
+        # print(f"step {self.global_step}, logging_loss: {logging_loss_scalar}")
+        # # print type of tr_loss_scalar and logging_loss_scalar
+        # print('tr_loss_scalar type: ', type(tr_loss_scalar))
+        # print('logging_loss_scalar type: ', type(logging_loss_scalar))
+
         logs["loss"] = (tr_loss_scalar - logging_loss_scalar) / self.args.logging_steps
         # backward compatibility for pytorch schedulers
         logs["learning_rate"] = (
@@ -684,5 +903,6 @@ class Trainer(transformers.Trainer):
             utils.join(self.args.output_dir, 'grad_params', f'global_step_{self.global_step:06d}.pt')
         )
         # ---
-
         return logging_loss_scalar
+
+        

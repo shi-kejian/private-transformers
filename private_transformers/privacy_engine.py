@@ -18,7 +18,7 @@ from torch import nn
 from . import autograd_grad_sample, transformers_support
 from .accounting import accounting_manager
 from .settings import AccountingMode, BackwardHookMode, ClippingMode, SUPPORTED_TRANSFORMERS
-
+from IPython import embed
 
 class PrivacyEngine(object):
     """Differentially-private optimization engine that works gracefully with Hugging Face transformers.
@@ -139,6 +139,14 @@ class PrivacyEngine(object):
         self.snr = None
         self.noise_limit = None
 
+        # 1209 implement diff prune 
+        ''''''
+        self.bert_params = None
+        self.alpha_params = None
+        self.finetune_params = None
+        self.per_params_alpha_dict = None
+        ''''''
+
         # Record parameters.
         self.module = module
         if named_params is None:
@@ -175,7 +183,7 @@ class PrivacyEngine(object):
     def attach(self, optimizer):
         # `loss_reduction="sum"` super important.
         autograd_grad_sample.add_hooks(model=self.module, loss_reduction="sum")
-
+        print('=================================attaching======================================')
         # Override zero grad.
         def dp_zero_grad(_self, *args, **kwargs):
             _self.privacy_engine.zero_grad()
@@ -243,6 +251,8 @@ class PrivacyEngine(object):
     def step(
         self,
         loss: torch.Tensor,
+        grad_params,
+        per_params_z_grad,
         scale=1.,
         # Function that takes in named_params and does something.
         # This option was included to help with another spectrum analysis project.
@@ -260,8 +270,8 @@ class PrivacyEngine(object):
                 raise ValueError("Ghost clipping does not support mixed-precision training.")
             self._ghost_step(loss=loss)
         else:
-            self._step(loss=loss, scale=scale, callback=callback)
-
+            self._step(loss=loss, scale=scale, grad_params=grad_params, per_params_z_grad=per_params_z_grad,callback=callback)
+            
     @torch.no_grad()
     def virtual_step(self, loss: torch.Tensor, scale=1.):
         """Virtual step function when there's gradient accumulation."""
@@ -398,6 +408,8 @@ class PrivacyEngine(object):
         self,
         loss,
         scale,
+        grad_params,
+        per_params_z_grad,
         callback,
     ):
         """Create noisy gradients.
@@ -418,7 +430,8 @@ class PrivacyEngine(object):
             logging.warning("Attempted to step, but the engine is on lock.")
             return
 
-        norm_sample, coef_sample = self._accumulate_summed_grad(loss=loss, scale=scale)
+        norm_sample, coef_sample = self._accumulate_summed_grad(loss=loss, scale=scale, grad_params=grad_params,
+                                                               per_params_z_grad=per_params_z_grad)
         # Collect stats for debugging.
         self.max_clip = coef_sample.max().item()
         self.min_clip = coef_sample.min().item()
@@ -432,14 +445,37 @@ class PrivacyEngine(object):
         self._accumulate_summed_grad(loss=loss, scale=scale)
 
     @torch.no_grad()
-    def _accumulate_summed_grad(self, loss, scale):
+    def _accumulate_summed_grad(self, loss, scale, grad_params=None, per_params_z_grad=None):
+        logging.warning("Accumulating summed gradients.")
         """Accumulate signal by summing clipped gradients.
 
         Removes `.grad_sample` and `.grad` for each variable that requires grad at the end.
         """
         with torch.enable_grad():
             loss.sum(dim=0).backward()
-
+        # Check that the names and values of the parameters are the same
+        if grad_params and per_params_z_grad:
+            for (name1, param1), (name2, param2) in zip(self.named_params, self.module.named_parameters()):
+                assert name1 == name2
+                assert (param1 == param2).all()
+            # print('assertion passed!!!')
+            for n, p in self.module.named_parameters():
+                if p.grad is None:
+                    print('p.grad is None:', n)
+                    continue
+                if "classifier" in n:
+                    self.bert_params[n][1].grad.copy_(p.grad.data)
+                    # print('p.grad.data':, p.grad.data)
+                else:
+                    try:
+                        self.bert_params[n][1].grad.copy_(p.grad.data * grad_params[n][1].data)
+                    except:
+                        embed()
+                    self.bert_params[n][2].grad.copy_(p.grad.data * grad_params[n][0].data *
+                                                        grad_params[n][2].data)
+                                                
+                    self.per_params_alpha_dict[n].grad.copy_(torch.sum(p.grad.data * grad_params[n][3].data * 
+                            per_params_z_grad[n].data))
         norm_sample = []
         for name, param in self.named_params:
             try:

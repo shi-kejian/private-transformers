@@ -68,6 +68,8 @@ class AuxiliaryArguments:
     store_grads: str = field(default="no")
     orthogonal_projection_path: Optional[str] = field(default=None)
     orthogonal_projection_rank: int = field(default=100)
+    l0_coef: float = field(default=0.1) # Added 11/30/2022 for Diff Prune
+    sparsity_pen_num: float = field(default=0.000000125) # Added 12/05/2022 for sweep
 
     def __post_init__(self):
         self.eval_spectrum = self.eval_spectrum.lower() in true_tags  # noqa
