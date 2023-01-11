@@ -10,6 +10,11 @@ from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertMode
 from transformers.models.distilbert import DistilBertModel, DistilBertForMaskedLM
 from transformers.models.roberta.modeling_roberta import RobertaModel, RobertaLMHead
 
+from torch.nn.parameter import Parameter
+import torch.nn.utils.parametrize as parametrize
+from typing import Union
+from functools import reduce
+
 logger = logging.getLogger(__name__)
 
 
@@ -378,3 +383,84 @@ class AlbertForPromptFinetuning(BertPreTrainedModel):
             # Regression output
             output = (torch.exp(logits[..., 1].unsqueeze(-1)) * (self.ub - self.lb) + self.lb,)
         return ((loss,) + output) if loss is not None else output
+
+
+def concrete_stretched(
+    alpha: torch.Tensor,
+    l: Union[float, int] = -1.5,
+    r: Union[float, int] = 1.5,
+    deterministic: bool = False
+) -> torch.Tensor:
+    if not deterministic:
+        u = torch.zeros_like(alpha).uniform_().clamp_(0.0001, 0.9999)
+        u_term = u.log() - (1-u).log()
+    else:
+        u_term = 0.
+    s = (torch.sigmoid(u_term + alpha))
+    s_stretched = s*(r-l) + l
+    z = s_stretched.clamp(0, 1000).clamp(-1000, 1)
+    return z
+
+
+def dict_to_device(d: dict, device: Union[str, torch.device]) -> dict:
+    return {k:v.to(device) for k,v in d.items()}
+
+
+def get_module_by_name(main_module: torch.nn.Module, module_ref: Union[str, list]) -> torch.nn.Module:
+    if isinstance(module_ref, str):
+        module_ref = module_ref.split(sep='.')
+    return reduce(getattr, module_ref, main_module)
+
+
+class DiffWeight(nn.Module):
+    """
+    Implementation of diff pruning weights using pytorch parametrizations
+    https://pytorch.org/tutorials/intermediate/parametrizations.html
+    """
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        alpha_init: Union[float, int],
+        concrete_lower: Union[float, int],
+        concrete_upper: Union[float, int],
+        structured: bool
+    ):
+        super().__init__()
+        self.concrete_lower = concrete_lower
+        self.concrete_upper = concrete_upper
+        self.structured = structured
+        
+        weight.requires_grad = False
+        self.register_parameter("finetune", Parameter(torch.clone(weight)))
+        self.register_parameter("alpha", Parameter(torch.zeros_like(weight) + alpha_init))
+        
+        if structured:
+            self.register_parameter("alpha_group", Parameter(torch.zeros((1,), device=weight.device) + alpha_init))
+              
+    def forward(self, X):
+        diff = (self.finetune - X).detach()
+        return (self.finetune - diff) + self.z * (self.finetune - X)
+    
+    @property
+    def z(self) -> Parameter:
+        z = self.dist(self.alpha)
+        if self.structured:
+            z *= self.dist(self.alpha_group)
+        return z
+    
+    @property
+    def alpha_weights(self) -> list:
+        alpha = [self.alpha]
+        if self.structured:
+            alpha.append(self.alpha_group)
+        return alpha
+
+    def dist(self, x) -> torch.Tensor:
+        return concrete_stretched(
+            x,
+            l=self.concrete_lower,
+            r=self.concrete_upper,
+            deterministic=(not self.training)
+        )
+            
